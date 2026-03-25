@@ -4,7 +4,7 @@ import sys
 import time
 import uuid
 import asyncio
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 from camoufox import DefaultAddons
@@ -19,8 +19,9 @@ if sys.platform == "win32":
 class ClearanceAPIServer:
     """
     Solver gabungan:
-      GET /turnstile  → Cloudflare Turnstile token
-      GET /clearance  → cf_clearance cookie (bypass Cloudflare WAF)
+      GET /turnstile   → Cloudflare Turnstile token
+      GET /clearance   → cf_clearance cookie (bypass Cloudflare WAF)
+      GET /aws-token   → aws-waf-token cookie (bypass AWS WAF)
     """
 
     HTML_TEMPLATE = """
@@ -40,13 +41,15 @@ class ClearanceAPIServer:
     """
 
     def __init__(self, headless: bool, thread: int, page_count: int,
-                 proxy_support: bool, proxy_file: str = "proxies.txt"):
+                 proxy_support: bool, proxy_file: str = "proxies.txt",
+                 cleanup_interval_minutes: int = 10):
         self.app = FastAPI()
         self.headless = headless
         self.thread_count = thread
         self.page_count = page_count
         self.proxy_support = proxy_support
         self.proxy_file = proxy_file
+        self.cleanup_interval_minutes = cleanup_interval_minutes
         self.page_pool = asyncio.Queue()
         self.browser_args = [
             "--no-sandbox",
@@ -65,6 +68,7 @@ class ClearanceAPIServer:
         self.app.get("/turnstile")(self.process_turnstile)
         self.app.get("/clearance")(self.process_clearance)
         self.app.get("/result")(self.get_result)
+        self.app.get("/aws-token")(self.process_aws_token)
 
     # ──────────────────────────────────────────────
     #  PROXY
@@ -134,7 +138,7 @@ class ClearanceAPIServer:
         await self._build_page_pool()
         logger.success(f"Pool siap: {self.page_pool.qsize()} halaman")
         asyncio.create_task(self._cleanup_results())
-        asyncio.create_task(self._periodic_cleanup())
+        asyncio.create_task(self._periodic_cleanup(self.cleanup_interval_minutes))
 
     async def _build_page_pool(self):
         """Buat/rebuild semua context dan page ke dalam pool."""
@@ -165,15 +169,18 @@ class ClearanceAPIServer:
 
     async def _periodic_cleanup(self, interval_minutes: int = 10):
         """
-        Periodic cleanup yang benar-benar membebaskan RAM:
-        - Jika semua page idle → full context restart (close & recreate)
-        - Jika ada page yang sedang dipakai → light cleanup saja, coba lagi siklus berikutnya
+        Periodic cleanup PAKSA yang membebaskan RAM:
+        - Berjalan setiap interval_minutes menit (bisa diatur di config.json)
+        - Tidak menunggu semua worker selesai — langsung paksa cleanup
+        - Tunggu page yang sedang dipakai (max 60 detik), lalu full restart
         """
+        DRAIN_TIMEOUT = 60  # Waktu tunggu max untuk page yang sedang dipakai (detik)
+
         while True:
             await asyncio.sleep(interval_minutes * 60)
-            logger.info("[Cleanup] Mencoba drain pool untuk restart context...")
+            logger.info(f"[Cleanup] Memulai FORCED cleanup (interval: {interval_minutes} menit)...")
 
-            # Drain semua page dari pool secara non-blocking
+            # Fase 1: Drain semua page dari pool secara non-blocking
             collected = []
             try:
                 while True:
@@ -182,47 +189,77 @@ class ClearanceAPIServer:
             except asyncio.QueueEmpty:
                 pass
 
-            if len(collected) < self.max_task_num:
-                # Ada task yang sedang berjalan → hanya light cleanup pada page yang idle
-                busy = self.max_task_num - len(collected)
-                logger.info(f"[Cleanup] {busy} page sedang dipakai, light cleanup pada {len(collected)} page idle...")
-                for page, context in collected:
-                    try:
-                        await page.unroute_all()
-                    except Exception:
-                        pass
-                    try:
-                        await context.clear_cookies()
-                    except Exception:
-                        pass
-                    try:
-                        await page.goto("about:blank")
-                    except Exception:
-                        pass
-                    await self.page_pool.put((page, context))
-                logger.info("[Cleanup] Light cleanup selesai, full restart ditunda ke siklus berikutnya")
-                continue
+            busy_count = self.max_task_num - len(collected)
 
-            # Semua page idle → Full context restart untuk bebaskan RAM
-            logger.info("[Cleanup] Semua page idle, memulai full context restart...")
+            if busy_count > 0:
+                # Ada page yang sedang dipakai, tunggu mereka selesai (max DRAIN_TIMEOUT)
+                logger.info(f"[Cleanup] Menunggu {busy_count} page yang sedang dipakai (max {DRAIN_TIMEOUT}s)...")
+                deadline = time.time() + DRAIN_TIMEOUT
+                while len(collected) < self.max_task_num and time.time() < deadline:
+                    try:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        item = await asyncio.wait_for(
+                            self.page_pool.get(), timeout=remaining
+                        )
+                        collected.append(item)
+                    except asyncio.TimeoutError:
+                        break
 
-            # Tutup semua page
+                still_busy = self.max_task_num - len(collected)
+                if still_busy > 0:
+                    logger.warning(f"[Cleanup] {still_busy} page masih dipakai setelah timeout, paksa restart tanpa mereka")
+
+            logger.info(f"[Cleanup] Full context restart dimulai ({len(collected)}/{self.max_task_num} page terkumpul)...")
+
+            # ── KRITIS: Invalidasi context SEBELUM close ──
+            # Simpan referensi lama, lalu kosongkan self.contexts SEGERA
+            # Agar worker yang selesai saat close TIDAK mengembalikan page mati ke pool
+            old_contexts = list(self.contexts)
+            self.contexts = []
+
+            # Fase 2: Tutup semua page yang berhasil dikumpulkan
             for page, _ in collected:
                 try:
                     await page.close()
                 except Exception:
                     pass
 
-            # Tutup semua context (ini yang bebaskan RAM Firefox)
-            for context in self.contexts:
+            # Fase 3: Tutup semua context lama (ini yang bebaskan RAM Firefox)
+            for context in old_contexts:
                 try:
                     await context.close()
                 except Exception:
                     pass
 
-            # Recreate semua context dan page
-            await self._build_page_pool()
-            logger.success(f"[Cleanup] Full context restart selesai, {self.page_pool.qsize()} halaman siap")
+            # Fase 3.5: Buang page mati yang masuk pool selama proses close
+            # (dari worker yang selesai SEBELUM self.contexts dikosongkan di atas)
+            stale = []
+            try:
+                while True:
+                    stale.append(self.page_pool.get_nowait())
+            except asyncio.QueueEmpty:
+                pass
+            if stale:
+                logger.info(f"[Cleanup] Membuang {len(stale)} stale page dari pool")
+
+            # Fase 4: Recreate semua context dan page baru
+            try:
+                await self._build_page_pool()
+                logger.success(f"[Cleanup] Full context restart selesai, {self.page_pool.qsize()} halaman siap")
+            except Exception as e:
+                logger.error(f"[Cleanup] Gagal rebuild pool: {e}, mencoba restart browser...")
+                try:
+                    try:
+                        await self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = await self.camoufox.start()
+                    await self._build_page_pool()
+                    logger.success(f"[Cleanup] Browser restart berhasil, {self.page_pool.qsize()} halaman siap")
+                except Exception as e2:
+                    logger.error(f"[Cleanup] FATAL: Gagal restart browser: {e2}")
 
     # ──────────────────────────────────────────────
     #  TURNSTILE SOLVER
@@ -366,7 +403,11 @@ class ClearanceAPIServer:
                 await page.unroute_all()
             except Exception:
                 pass
-            await self.page_pool.put((page, context))
+            # Hanya kembalikan ke pool jika context masih valid (belum di-restart cleanup)
+            if context in self.contexts:
+                await self.page_pool.put((page, context))
+            else:
+                logger.info(f"[Turnstile] Page dibuang (context sudah di-restart oleh cleanup) — {task_id}")
 
 
     # ──────────────────────────────────────────────
@@ -440,7 +481,78 @@ class ClearanceAPIServer:
                 await page.goto("about:blank")
             except Exception:
                 pass
-            await self.page_pool.put((page, context))
+            # Hanya kembalikan ke pool jika context masih valid (belum di-restart cleanup)
+            if context in self.contexts:
+                await self.page_pool.put((page, context))
+            else:
+                logger.info(f"[Clearance] Page dibuang (context sudah di-restart oleh cleanup) — {task_id}")
+
+    # ──────────────────────────────────────────────
+    #  AWS WAF TOKEN SOLVER
+    # ──────────────────────────────────────────────
+
+    async def _solve_aws_token(self, task_id: str, url: str, timeout: int = 30):
+        """
+        Navigasi browser ke URL target, tunggu aws-waf-token cookie muncul,
+        lalu return cookies + user-agent.
+        """
+        start_time = time.time()
+        page, context = await self.page_pool.get()
+        try:
+            logger.info(f"[AWS-Token] Navigasi ke {url} — {task_id}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+            # Tunggu aws-waf-token cookie muncul
+            deadline = time.time() + timeout
+            waf_cookie = None
+            while time.time() < deadline:
+                cookies = await context.cookies()
+                waf_cookie = next((c for c in cookies if c["name"] == "aws-waf-token"), None)
+                if waf_cookie:
+                    break
+                await asyncio.sleep(1)
+
+            elapsed = round(time.time() - start_time, 3)
+
+            if waf_cookie:
+                all_cookies = await context.cookies()
+                cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in all_cookies)
+                user_agent = await page.evaluate("navigator.userAgent")
+                self.results[task_id] = {
+                    "status": "success",
+                    "elapsed_time": elapsed,
+                    "aws_waf_token": waf_cookie["value"],
+                    "cookies": cookie_header,
+                    "user_agent": user_agent,
+                }
+                logger.success(f"[AWS-Token] Sukses — {task_id} ({elapsed}s)")
+            else:
+                title = await page.title()
+                self.results[task_id] = {
+                    "status": "error",
+                    "elapsed_time": elapsed,
+                    "value": "waf_fail",
+                    "message": f"aws-waf-token tidak ditemukan setelah {timeout}s. Judul: '{title}'",
+                }
+                logger.warning(f"[AWS-Token] Gagal — {task_id}")
+
+        except Exception as e:
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {"status": "error", "elapsed_time": elapsed, "value": str(e)}
+            logger.error(f"[AWS-Token] Exception — {task_id}: {e}")
+        finally:
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
+            try:
+                await page.goto("about:blank")
+            except Exception:
+                pass
+            if context in self.contexts:
+                await self.page_pool.put((page, context))
+            else:
+                logger.info(f"[AWS-Token] Page dibuang (context sudah di-restart) — {task_id}")
 
     # ──────────────────────────────────────────────
     #  ENDPOINTS
@@ -491,6 +603,30 @@ class ClearanceAPIServer:
             self.results.pop(task_id, None)
             return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
+    async def process_aws_token(
+        self,
+        url: str = Query(..., description="URL target (e.g. https://vala-wallet.cc/waitlist)"),
+        timeout: int = Query(30, description="Waktu tunggu maksimal dalam detik"),
+    ):
+        """
+        Endpoint untuk mendapatkan aws-waf-token cookie.
+        Response sukses berisi: aws_waf_token, cookies, user_agent
+        """
+        if not url:
+            raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' wajib diisi"})
+
+        if self.page_pool.qsize() == 0:
+            return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
+
+        task_id = str(uuid.uuid4())
+        self.results[task_id] = {"status": "process", "message": "fetching aws-waf-token", "start_time": time.time()}
+        try:
+            asyncio.create_task(self._solve_aws_token(task_id, url, timeout))
+            return JSONResponse(content={"task_id": task_id, "status": "accepted"}, status_code=202)
+        except Exception as e:
+            self.results.pop(task_id, None)
+            return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
     async def get_result(self, task_id: str = Query(..., alias="id")):
         if not task_id:
             return JSONResponse(content={"status": "error", "message": "Parameter id wajib diisi"}, status_code=400)
@@ -522,9 +658,11 @@ class ClearanceAPIServer:
         return JSONResponse(content=result, status_code=status_code)
 
 
-def create_app(headless, thread, page_count, proxy_support, proxy_file="proxies.txt") -> FastAPI:
+def create_app(headless, thread, page_count, proxy_support, proxy_file="proxies.txt",
+               cleanup_interval_minutes=10) -> FastAPI:
     server = ClearanceAPIServer(headless=headless, thread=thread, page_count=page_count,
-                                proxy_support=proxy_support, proxy_file=proxy_file)
+                                proxy_support=proxy_support, proxy_file=proxy_file,
+                                cleanup_interval_minutes=cleanup_interval_minutes)
     return server.app
 
 
@@ -541,7 +679,7 @@ def _print_banner():
   ____        _                           |_|
  / ___|  ___ | |_   _____ _ __
  \___ \ / _ \| \ \ / / _ \ '__|
-  ___) | (_) | |\ V /  __/ |   Clearance v1.0.0
+  ___) | (_) | |\ V /  __/ |    v1.0.4
  |____/ \___/|_| \_/ \___|_|
 """
     print("\033[95m" + banner + "\033[0m")
@@ -550,17 +688,123 @@ def _print_banner():
 
 
 # ──────────────────────────────────────────────
+#  VPS AUTO SETUP (Linux only)
+# ──────────────────────────────────────────────
+def _vps_setup():
+    """Setup otomatis untuk VPS Linux baru. Skip di Windows."""
+    if sys.platform == "win32":
+        return
+
+    import subprocess, shutil
+
+    print("\n" + "═" * 52)
+    print("  🖥️   CEK ENVIRONMENT VPS")
+    print("═" * 52)
+
+    # 1. Tampilkan versi Python
+    py_ver = sys.version.split()[0]
+    py_major, py_minor = sys.version_info[:2]
+    if py_major >= 3 and py_minor >= 10:
+        print(f"  ✅  Python {py_ver} (>= 3.10)")
+    else:
+        print(f"  ⚠️  Python {py_ver} terdeteksi. Disarankan >= 3.10")
+
+    # 2. Cek pip
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "--version"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print("  ✅  pip sudah terpasang")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("  📦  pip belum ada, menginstall via ensurepip...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "ensurepip", "--upgrade"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("  ✅  pip berhasil diinstall")
+        except Exception:
+            print("  ⚠️  Gagal install pip. Jalankan manual: sudo apt install python3-pip -y")
+
+    # 3. Cek python3-venv
+    try:
+        import venv
+        print("  ✅  python3-venv sudah terpasang")
+    except ImportError:
+        print("  📦  python3-venv belum ada, menginstall...")
+        try:
+            subprocess.check_call(
+                ["apt-get", "install", "-y", f"python3-venv", "python3.{py_minor}-venv"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("  ✅  python3-venv berhasil diinstall")
+        except Exception:
+            print("  ⚠️  Gagal install python3-venv. Jalankan manual: sudo apt install python3-venv -y")
+
+    # 4. Cek apakah jalan di venv
+    in_venv = (hasattr(sys, 'real_prefix') or
+               (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix))
+    if in_venv:
+        print(f"  ✅  Virtual environment aktif: {sys.prefix}")
+    else:
+        print("  ⚠️  Tidak dalam virtual environment")
+        print("       Disarankan: python3 -m venv venv && source venv/bin/activate")
+
+    # 5. Playwright/Camoufox browser deps (Linux)
+    if shutil.which("apt-get"):
+        print("  📦  Menginstall browser dependencies (playwright install-deps)...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "playwright", "install-deps"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("  ✅  Browser dependencies terpasang")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Playwright mungkin belum terinstall, akan diinstall oleh _auto_install nanti
+            # Coba install system deps langsung
+            try:
+                subprocess.check_call(
+                    ["apt-get", "install", "-y",
+                     "libatk-bridge2.0-0", "libcups2", "libdrm2", "libgbm1",
+                     "libgtk-3-0", "libnspr4", "libnss3", "libxcomposite1",
+                     "libxdamage1", "libxrandr2", "xvfb",
+                     "fonts-liberation", "libappindicator3-1", "libasound2"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                print("  ✅  Browser dependencies terpasang (via apt)")
+            except Exception:
+                print("  ⚠️  Gagal install browser deps. Jalankan manual setelah install:")
+                print("       python3 -m playwright install-deps")
+
+    # 6. apt update (background check)
+    if shutil.which("apt-get") and os.geteuid() == 0:
+        print("  🔄  Menjalankan apt update...")
+        try:
+            subprocess.check_call(
+                ["apt-get", "update", "-y"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("  ✅  apt update selesai")
+        except Exception:
+            print("  ⚠️  apt update gagal, lanjut saja")
+
+    print("═" * 52 + "\n")
+
+
+# ──────────────────────────────────────────────
 #  AUTO INSTALL
 # ──────────────────────────────────────────────
 def _auto_install():
     import subprocess
-    PACKAGES = ["fastapi", "uvicorn", "camoufox", "loguru", "psutil"]
+    PACKAGES = ["fastapi==0.95.2", "uvicorn", "camoufox", "loguru", "psutil"]
     print("\n" + "═" * 52)
     print("  🔧  Memeriksa dependensi yang dibutuhkan...")
     print("═" * 52)
     for pkg in PACKAGES:
         try:
-            __import__(pkg.split("[")[0])
+            pkg_import = pkg.split("==")[0].split("[")[0]
+            __import__(pkg_import)
             print(f"  ✅  {pkg} sudah terpasang")
         except ImportError:
             print(f"  📦  Menginstall {pkg}...")
@@ -629,6 +873,7 @@ CONFIG_DEFAULTS = {
     "host":          "0.0.0.0",
     "port":          8001,   # port berbeda dari api_server.py agar bisa jalan bersamaan
     "debug":         False,
+    "cleanup_interval_minutes": 10,  # interval cleanup paksa (menit)
 }
 
 
@@ -676,6 +921,7 @@ def _show_config_summary(cfg: dict):
         "host":          ("Host server",                      "str"),
         "port":          ("Port server",                      "int"),
         "debug":         ("Mode Debug",                       "bool"),
+        "cleanup_interval_minutes": ("Interval cleanup paksa (menit)", "int"),
     }
     for i, (key, (label, _)) in enumerate(labels.items(), 1):
         print(f"  [{i}] {label:<38} : {cfg.get(key)}")
@@ -689,7 +935,7 @@ def _interactive_config(cfg: dict) -> dict:
     if ans not in ("n", "no", "tidak"):
         return cfg
 
-    field_order = ["headless", "thread", "page_count", "proxy_support", "host", "port", "debug"]
+    field_order = ["headless", "thread", "page_count", "proxy_support", "host", "port", "debug", "cleanup_interval_minutes"]
     labels = {
         "headless":      "Mode Headless (true/false)",
         "thread":        "Jumlah thread",
@@ -698,6 +944,7 @@ def _interactive_config(cfg: dict) -> dict:
         "host":          "Host server",
         "port":          "Port server",
         "debug":         "Mode Debug (true/false)",
+        "cleanup_interval_minutes": "Interval cleanup paksa (menit)",
     }
     print("\n  ✏️   Tekan Enter untuk mempertahankan nilai saat ini")
     print("─" * 52)
@@ -779,6 +1026,7 @@ def _check_system(cfg: dict):
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     _print_banner()
+    _vps_setup()
     _auto_install()
     config = _load_config()
     config = _interactive_config(config)
@@ -806,5 +1054,6 @@ if __name__ == "__main__":
         page_count=config["page_count"],
         proxy_support=config["proxy_support"],
         proxy_file=config.get("proxy_file", "proxies.txt"),
+        cleanup_interval_minutes=config.get("cleanup_interval_minutes", 10),
     )
     uvicorn.run(app, host=config["host"], port=config["port"])
