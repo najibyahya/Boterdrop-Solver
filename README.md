@@ -1,22 +1,23 @@
-# Turnstile CAPTCHA Solver
+# Turnstile CAPTCHA & Clearance Solver
 
 > Terinspirasi dari [SGAHSCAJASCJ/Turnstile-Solver](https://github.com/SGAHSCAJASCJ/Turnstile-Solver)
 
-Solusi pemecahan CAPTCHA Cloudflare Turnstile berkinerja tinggi yang dibangun dengan **FastAPI** dan teknologi browser asinkron (**Camoufox**), menyediakan layanan RESTful API yang siap dipakai.
+Solusi pemecahan CAPTCHA Cloudflare Turnstile, cf_clearance, dan AWS WAF Token berkinerja tinggi yang dibangun dengan **FastAPI** dan teknologi browser asinkron (**Camoufox**), menyediakan layanan RESTful API yang siap dipakai.
 
 ---
 
-## ✨ Fitur Tambahan
+## ✨ Fitur
 
 | Fitur | Keterangan |
 |---|---|
-| 📦 Auto Install | Dependensi & browser Camoufox diinstall otomatis saat pertama kali jalan |
-| ⚙️ Konfigurasi via `config.json` | Tidak perlu edit kode, semua setting dari satu file |
-| 🖥️ Cek Sistem | Menampilkan info CPU & RAM + rekomendasi kesesuaian config sebelum running |
-| 🔌 Cek Port | Deteksi port yang sudah terpakai dan minta ganti otomatis |
+| 🔄 3 Endpoint Solver | `/turnstile`, `/clearance`, `/aws-token` |
+| 📦 Auto Install | Dependensi & browser Camoufox diinstall otomatis |
+| 🖥️ VPS Auto Setup | Deteksi & install python, pip, venv, browser deps otomatis di Linux |
+| ⚙️ Konfigurasi via `config.json` | Semua setting dari satu file + prompt interaktif |
 | 🔁 Proxy Rotation | Dukungan proxy per-thread dengan rotasi round-robin |
+| 🧹 Forced Cleanup | Cleanup berkala paksa (interval bisa diatur) meski ada worker aktif |
 | 🐛 Mode Debug | Aktifkan/matikan log detail via config |
-| 🪟 Windows / RDP | Patch asyncio untuk kompatibilitas penuh di Windows & Ubuntu |
+| 🪟 Windows / Linux / RDP | Kompatibel penuh di semua platform |
 
 ---
 
@@ -34,36 +35,59 @@ Solusi pemecahan CAPTCHA Cloudflare Turnstile berkinerja tinggi yang dibangun de
 ## 🚀 Mulai Cepat
 
 ### Persyaratan
-- Python 3.8+
+- Python 3.10+
 - Windows / Linux / macOS / RDP
 - RAM 2 GB+
 - Koneksi internet stabil
 
 ### Instalasi & Menjalankan
+
+Ada **dua server** yang bisa dijalankan:
+
+| Server | File | Endpoint | Keterangan |
+|---|---|---|---|
+| **Solver** | `api_server.py` | `/turnstile`, `/clearance`, `/aws-token` | Solver lengkap (3 endpoint) |
+
 ```bash
 git clone https://github.com/najibyahya/Turnstile-Solver
 cd Turnstile-Solver
+
+# Server lengkap (turnstile + clearance + aws-token)
 python api_server.py
 ```
 
-> Script akan otomatis menginstall semua dependensi yang dibutuhkan (`fastapi`, `uvicorn`, `camoufox`, `loguru`, `psutil`) dan mengunduh browser Camoufox jika belum ada.
+> Script akan otomatis menginstall semua dependensi (`fastapi==0.95.2`, `uvicorn`, `camoufox`, `loguru`, `psutil`) dan mengunduh browser Camoufox jika belum ada.
 
-### 🖥️ Catatan untuk VPS / Server Linux (headless=false)
+---
 
-Jika kamu menggunakan `"headless": false` di VPS tanpa GUI, browser **tidak bisa membuka tampilan** secara langsung. Kamu perlu **Xvfb** (virtual display).
+## 🖥️ Setup VPS Linux Baru
 
-**Install Xvfb:**
+Script `api_server.py` sudah memiliki **auto-setup** yang akan mengecek dan menginstall kebutuhan VPS secara otomatis. Namun jika ingin setup manual:
+
 ```bash
-sudo apt-get install -y xvfb
+# 1. Update system
+sudo apt update -y && sudo apt upgrade -y
+
+# 2. Install Python 3.10+ (biasanya sudah ada di Ubuntu 22.04+)
+sudo apt install python3 python3-pip python3-venv -y
+
+# 3. Buat & aktifkan virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 4. Install module
+pip install fastapi==0.95.2 uvicorn camoufox loguru psutil
+
+# 5. Install browser dependencies
+python3 -m playwright install-deps
+
+# 6. Clone & jalankan
+git clone https://github.com/najibyahya/Turnstile-Solver
+cd Turnstile-Solver
+python3 api_server.py
 ```
 
-**Jalankan script dengan Xvfb:**
-```bash
-xvfb-run -a python3 api_server.py
-```
-
-> Script akan otomatis mendeteksi kondisi ini dan mengingatkan kamu jika lupa menggunakan `xvfb-run`.
-> Alternatif paling mudah: set `"headless": true` di `config.json`.
+> Jika menggunakan `headless: false`, jalankan dengan `xvfb-run -a python3 api_server.py`
 
 ---
 
@@ -80,7 +104,8 @@ Edit file `config.json` sesuai kebutuhan **sebelum** menjalankan script, atau ub
     "proxy_file":    "proxies.txt",
     "host":          "0.0.0.0",
     "port":          8000,
-    "debug":         false
+    "debug":         false,
+    "cleanup_interval_minutes": 10
 }
 ```
 
@@ -94,6 +119,7 @@ Edit file `config.json` sesuai kebutuhan **sebelum** menjalankan script, atau ub
 | `host` | string | `0.0.0.0` | Host binding server |
 | `port` | int | `8000` | Port server |
 | `debug` | bool | `false` | Tampilkan log DEBUG detail |
+| `cleanup_interval_minutes` | int | `10` | Interval cleanup paksa dalam menit |
 
 ---
 
@@ -124,7 +150,7 @@ Proxy akan dirotasi secara **round-robin** — setiap thread browser mendapat pr
 
 ## 📖 Dokumentasi API
 
-### ➡️ Kirim Tugas CAPTCHA
+### ➡️ Solve Turnstile CAPTCHA
 ```http
 GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA...
 ```
@@ -136,13 +162,29 @@ GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA...
 | `action` | ❌ | Nilai `data-action` (opsional) |
 | `cdata` | ❌ | Nilai `data-cdata` (opsional) |
 
-**Respons `202 Accepted`:**
-```json
-{
-  "task_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "accepted"
-}
+---
+
+### ➡️ Get cf_clearance Cookie
+```http
+GET /clearance?url=https://example.com&timeout=30
 ```
+
+| Parameter | Wajib | Keterangan |
+|---|---|---|
+| `url` | ✅ | URL target yang dilindungi Cloudflare |
+| `timeout` | ❌ | Waktu tunggu dalam detik (default: 30) |
+
+---
+
+### ➡️ Get AWS WAF Token
+```http
+GET /aws-token?url=https://example.com&timeout=30
+```
+
+| Parameter | Wajib | Keterangan |
+|---|---|---|
+| `url` | ✅ | URL target yang dilindungi AWS WAF |
+| `timeout` | ❌ | Waktu tunggu dalam detik (default: 30) |
 
 ---
 
@@ -151,7 +193,9 @@ GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA...
 GET /result?id=<task_id>
 ```
 
-**Respons sukses `200 OK`:**
+Semua endpoint solver (`/turnstile`, `/clearance`, `/aws-token`) mengembalikan `task_id`. Gunakan endpoint ini untuk poll hasilnya.
+
+**Respons `/turnstile` sukses:**
 ```json
 {
   "status": "success",
@@ -160,14 +204,36 @@ GET /result?id=<task_id>
 }
 ```
 
+**Respons `/clearance` sukses:**
+```json
+{
+  "status": "success",
+  "elapsed_time": 3.102,
+  "cf_clearance": "abcdef123...",
+  "user_agent": "Mozilla/5.0 ...",
+  "cookies": "cf_clearance=abcdef123; __cf_bm=xyz..."
+}
+```
+
+**Respons `/aws-token` sukses:**
+```json
+{
+  "status": "success",
+  "elapsed_time": 2.871,
+  "aws_waf_token": "eyJhbGci...",
+  "user_agent": "Mozilla/5.0 ...",
+  "cookies": "aws-waf-token=eyJhbGci...; ..."
+}
+```
+
 **Kode status HTTP:**
 | Kode | Kondisi |
 |---|---|
-| `200` | Token berhasil didapat |
-| `202` | Masih diproses, coba lagi |
+| `200` | Berhasil |
+| `202` | Masih diproses / diterima, coba lagi |
 | `404` | `task_id` tidak valid atau sudah expired |
 | `408` | Timeout (> 5 menit) |
-| `422` | Captcha gagal diselesaikan |
+| `422` | Gagal diselesaikan |
 | `429` | Server penuh, coba lagi nanti |
 
 ---
@@ -181,12 +247,10 @@ import time
 
 BASE_URL = "http://localhost:8000"
 
+# ── Solve Turnstile ──
 def solve_turnstile(url: str, sitekey: str) -> str:
-    # Kirim tugas
     res = requests.get(f"{BASE_URL}/turnstile", params={"url": url, "sitekey": sitekey})
     task_id = res.json()["task_id"]
-
-    # Poll hasil
     while True:
         result = requests.get(f"{BASE_URL}/result", params={"id": task_id}).json()
         if result["status"] == "success":
@@ -195,8 +259,29 @@ def solve_turnstile(url: str, sitekey: str) -> str:
             raise Exception(f"Gagal: {result.get('value')}")
         time.sleep(1)
 
-token = solve_turnstile("https://example.com", "0x4AAAAAAA...")
-print("Token:", token)
+# ── Get cf_clearance ──
+def get_clearance(url: str) -> dict:
+    res = requests.get(f"{BASE_URL}/clearance", params={"url": url})
+    task_id = res.json()["task_id"]
+    while True:
+        result = requests.get(f"{BASE_URL}/result", params={"id": task_id}).json()
+        if result["status"] == "success":
+            return result  # cf_clearance, user_agent, cookies
+        elif result["status"] == "error":
+            raise Exception(f"Gagal: {result.get('message')}")
+        time.sleep(1)
+
+# ── Get AWS WAF Token ──
+def get_aws_token(url: str) -> dict:
+    res = requests.get(f"{BASE_URL}/aws-token", params={"url": url})
+    task_id = res.json()["task_id"]
+    while True:
+        result = requests.get(f"{BASE_URL}/result", params={"id": task_id}).json()
+        if result["status"] == "success":
+            return result  # aws_waf_token, user_agent, cookies
+        elif result["status"] == "error":
+            raise Exception(f"Gagal: {result.get('message')}")
+        time.sleep(1)
 ```
 
 ### Node.js
@@ -205,27 +290,40 @@ const axios = require("axios");
 
 const BASE_URL = "http://localhost:8000";
 
-async function solveTurnstile(url, sitekey) {
-  // Kirim tugas
-  const { data } = await axios.get(`${BASE_URL}/turnstile`, {
-    params: { url, sitekey },
-  });
-  const taskId = data.task_id;
-
-  // Poll hasil
+async function pollResult(taskId) {
   while (true) {
     const { data: result } = await axios.get(`${BASE_URL}/result`, {
       params: { id: taskId },
     });
-    if (result.status === "success") return result.value;
-    if (result.status === "error") throw new Error(`Gagal: ${result.value}`);
+    if (result.status === "success") return result;
+    if (result.status === "error") throw new Error(JSON.stringify(result));
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
 
-solveTurnstile("https://example.com", "0x4AAAAAAA...")
-  .then((token) => console.log("Token:", token))
-  .catch(console.error);
+// Solve Turnstile
+async function solveTurnstile(url, sitekey) {
+  const { data } = await axios.get(`${BASE_URL}/turnstile`, {
+    params: { url, sitekey },
+  });
+  return pollResult(data.task_id);
+}
+
+// Get cf_clearance
+async function getClearance(url) {
+  const { data } = await axios.get(`${BASE_URL}/clearance`, {
+    params: { url },
+  });
+  return pollResult(data.task_id);
+}
+
+// Get AWS WAF Token
+async function getAwsToken(url) {
+  const { data } = await axios.get(`${BASE_URL}/aws-token`, {
+    params: { url },
+  });
+  return pollResult(data.task_id);
+}
 ```
 
 ---
@@ -244,30 +342,30 @@ solveTurnstile("https://example.com", "0x4AAAAAAA...")
 
 | Log | Artinya | Solusi |
 |---|---|---|
-| `Percobaan captcha X gagal: Timeout 400ms exceeded` | Captcha belum muncul / lambat load | Normal jika tidak terlalu sering. Aktifkan `debug: false` untuk sembunyikan |
-| `Pool halaman berhasil diinisialisasi, berisi 0 halaman` | Browser gagal membuat halaman | Cek RAM tersedia, coba kurangi `thread` atau `page_count` |
+| `Percobaan captcha X gagal: Timeout 400ms exceeded` | Captcha belum muncul / lambat load | Normal jika tidak terlalu sering |
+| `Pool halaman berhasil diinisialisasi, berisi 0 halaman` | Browser gagal membuat halaman | Cek RAM tersedia, kurangi `thread` atau `page_count` |
 | `proxy_support aktif tapi file 'proxies.txt' tidak ditemukan` | File proxy tidak ada | Buat file `proxies.txt` dengan daftar proxy |
-| `Format proxy tidak valid: ...` | Format proxy di file salah | Gunakan format `protocol://host:port` atau `protocol://user:pass@host:port` |
-| `Server telah mencapai kapasitas maksimum` | Semua slot browser sedang terpakai | Naikkan `thread` atau `page_count`, atau tunggu request selesai |
+| `Server penuh, coba lagi nanti` | Semua slot browser sedang terpakai | Naikkan `thread` atau `page_count`, atau tunggu |
 
 ### Kode HTTP response API
 
 | Kode | Artinya |
 |---|---|
-| `202` | Tugas diterima / masih diproses — poll ulang beberapa saat |
-| `400` | Parameter `url` atau `sitekey` tidak disertakan |
+| `202` | Tugas diterima / masih diproses — poll ulang |
+| `400` | Parameter wajib tidak disertakan |
 | `404` | `task_id` tidak valid atau sudah expired |
 | `408` | Tugas timeout (> 5 menit) |
-| `422` | Captcha gagal diselesaikan setelah 30 percobaan |
-| `429` | Server penuh — semua slot browser sedang terpakai |
+| `422` | Gagal diselesaikan |
+| `429` | Server penuh — semua slot browser terpakai |
 | `500` | Error tak terduga di server |
 
 ---
 
-## 🔧 Tips Penyetelan Performa
+## 🔧 Tips Performa
 
 - **`thread`**: Sesuaikan dengan jumlah core CPU. Contoh: 8-core → maksimal `thread: 8`
 - **`page_count`**: Mulai dari `1`. Naikkan hanya jika RAM mencukupi (±300 MB per halaman)
+- **`cleanup_interval_minutes`**: Turunkan (misal `5`) jika RAM terbatas
 - **`debug: false`**: Matikan untuk output bersih di production
 - **Gunakan proxy** untuk meningkatkan tingkat keberhasilan di sitekey yang ketat
 
@@ -290,6 +388,6 @@ MIT License — Lihat file [LICENSE](LICENSE) untuk detail.
 
 <div align="center">
 
-**⚡ Performa Tinggi &nbsp;|&nbsp; 🚀 Mudah Dipakai &nbsp;|&nbsp; 🛡️ Stabil & Andal &nbsp;|&nbsp; 🌐 Proxy Ready**
+**⚡ Performa Tinggi &nbsp;|&nbsp; 🚀 3 Endpoint Solver &nbsp;|&nbsp; 🛡️ Stabil & Andal &nbsp;|&nbsp; 🌐 Proxy Ready &nbsp;|&nbsp; 🖥️ VPS Auto Setup**
 
 </div>
