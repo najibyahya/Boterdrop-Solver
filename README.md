@@ -26,7 +26,7 @@ Langkah-langkah yang **paling disarankan** di VPS Linux (Ubuntu/Debian) baru:
 ```bash
 # 1. Update system & Install system dependencies browser
 sudo apt update -y && sudo apt upgrade -y
-sudo apt install -y xvfb libasound2 python3 python3-pip python3-venv
+sudo apt install -y xvfb libasound2 python3 python3-pip python3.12-venv 
 
 # 2. Buat & Aktifkan virtual environment (sangat disarankan)
 python3 -m venv venv
@@ -37,7 +37,7 @@ git clone https://github.com/najibyahya/Turnstile-Solver
 cd Turnstile-Solver
 
 # 4. Install dependensi Python dasar
-pip install fastapi uvicorn "camoufox[fetch]" loguru psutil playwright
+pip install fastapi==0.95.2 uvicorn "camoufox[fetch]" loguru psutil playwright
 
 # 5. FETCH & INSTALL DEPENDENCY MANUAL (LAKUKAN SEKALI SAJA)
 # Ini mencegah masalah "Version information not found" & "browser dependencies"
