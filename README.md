@@ -49,8 +49,7 @@ python3 -m camoufox fetch
 python3 -m playwright install-deps
 
 # 6. Jalankan Server
-# (Gunakan xvfb-run jika VPS Anda tidak memiliki GUI/Display)
-xvfb-run -a python3 api_server.py
+python3 api_server.py
 ```
 
 > **INFO:** Pada percobaan berikutnya, Anda cukup melakukan:
