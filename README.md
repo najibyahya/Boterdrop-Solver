@@ -1,14 +1,15 @@
 # Turnstile, cf_clearance, & AWS WAF Token Solver
 
-> Terinspirasi dari [SGAHSCAJASCJ/Turnstile-Solver](https://github.com/SGAHSCAJASCJ/Turnstile-Solver)
+> Terinspirasi dari : 
+[SGAHSCAJASCJ/Turnstile-Solver](https://github.com/SGAHSCAJASCJ/Turnstile-Solver) (Turnstile) - [verfired8975/recaptcha-v3-solver](https://github.com/verfired8975/recaptcha-v3-solver) (Recaptcha V3) 
 
-Solusi pemecahan CAPTCHA Cloudflare Turnstile, cf_clearance, dan AWS WAF Token berkinerja tinggi yang dibangun dengan **FastAPI** dan teknologi browser asinkron (**Camoufox**), menyediakan layanan RESTful API yang siap dipakai.
+Solusi pemecahan CAPTCHA Cloudflare Turnstile, cf_clearance, Recaptcha V3 & AWS WAF Token berkinerja tinggi yang dibangun dengan **FastAPI** dan teknologi browser asinkron (**Camoufox**), menyediakan layanan RESTful API yang siap dipakai.
 
 ---
 
 ## ✨ Fitur Utama
 
-- **3 Endpoint Solver**: `/turnstile`, `/clearance`, `/aws-token`
+- **4 Endpoint Solver**: `/turnstile`, `/clearance`, `/aws-token`, `/recaptchaV3`
 - **Auto Install & Fetch**: Dependensi Python dan Camoufox diinstall otomatis saat pertama kali jalan.
 - **Konfigurasi via `config.json`**: Semua setting dapat diatur dari file atau prompt interaktif.
 - **Proxy Rotation**: Dukungan proxy per-instance browser dengan rotasi round-robin.
@@ -32,13 +33,13 @@ sudo apt install python3 -y
 sudo apt install python3-pip -y
 sudo apt install python3-venv -y
 
-# 2. Buat & Aktifkan virtual environment (sangat disarankan)
-python3 -m venv venv
-source venv/bin/activate
-
-# 3. Clone Repository
+# 2. Clone Repository
 git clone https://github.com/najibyahya/Turnstile-Solver
 cd Turnstile-Solver
+
+# 3. Buat & Aktifkan virtual environment (sangat disarankan)
+python3 -m venv venv
+source venv/bin/activate
 
 # 4. Install dependensi Python dasar
 pip install fastapi==0.95.2 uvicorn "camoufox[fetch]" loguru psutil playwright
@@ -47,12 +48,13 @@ pip install fastapi==0.95.2 uvicorn "camoufox[fetch]" loguru psutil playwright
 # Ini mencegah masalah "Version information not found" & "browser dependencies"
 python3 -m camoufox fetch
 python3 -m playwright install-deps
+playwright install
 
 # 6. Jalankan Server
 python3 api_server.py
 ```
 
-> **INFO:** Pada percobaan berikutnya, Anda cukup melakukan:
+> **INFO:** Jika menggunakan mode headless (false):
 > ```bash
 > source venv/bin/activate
 > xvfb-run -a python3 api_server.py
@@ -98,8 +100,6 @@ http://user:pass@ip:port
 socks5://user:pass@ip:port
 ```
 
----
-
 ## 📖 Endpoint Dokumentasi API
 
 Solver ini bekerja dengan cara asynchronous (membuat antrean tugas). Masing-masing endpoint memblokir proses sampai token sukses diambil atau dikembalikan dalam status gagal.
@@ -111,20 +111,57 @@ Solver ini bekerja dengan cara asynchronous (membuat antrean tugas). Masing-masi
 | Turnstile | `GET /turnstile` | `url` (Target URL), `sitekey` (Turnstile Key) |
 | cf_clearance | `GET /clearance` | `url` (Target URL), `timeout` (opsional batas detik) |
 | AWS WAF | `GET /aws-token` | `url` (Target URL), `timeout` (opsional batas detik) |
+| reCAPTCHA v3 | `GET atau POST` ke `/recaptchaV3` | `url` / `domain` (Target URL), `sitekey` / `siteKey` (reCAPTCHA Key), `action` (opsional, default: `submit`) |
 
-**Contoh Response Sukses (202 Accepted):**
+#### 🌐 Contoh Request HTTP (cURL) Pembuatan Task
+
+##### A. Cloudflare Turnstile (`GET /turnstile`)
+```bash
+curl -X GET "http://127.0.0.1:8001/turnstile?url=https://target.cc/&sitekey=0x4AAAAAxxxxxxxxETLYn"
+```
+
+##### B. Cloudflare cf_clearance (`GET /clearance`)
+```bash
+curl -X GET "http://127.0.0.1:8001/clearance?url=https://target.cc/&timeout=30"
+```
+
+##### C. AWS WAF Token (`GET /aws-token`)
+```bash
+curl -X GET "http://127.0.0.1:8001/aws-token?url=https://target.cc/waitlist&timeout=30"
+```
+
+##### D. Google reCAPTCHA v3 (`GET` atau `POST` ke `/recaptchaV3`)
+* **Menggunakan HTTP GET:**
+```bash
+curl -X GET "http://127.0.0.1:8001/recaptchaV3?url=https://target.cc&sitekey=6Ldqxxxxxxxxxxxxxx19Tpa1XsSZfIW&action=submit"
+```
+* **Menggunakan HTTP POST (JSON Body):**
+```bash
+curl -X POST "http://127.0.0.1:8001/recaptchaV3" \
+     -H "Content-Type: application/json" \
+     -d '{"url": "https://target.cc", "sitekey": "6Ldqxxxxxxxxxxxxxx19Tpa1XsSZfIW", "action": "submit"}'
+```
+
+**Contoh Response Sukses Pembuatan Task (202 Accepted):**
 ```json
 {
-  "task_id": "8a31e...b41",
+  "task_id": "8a31e3d4-b41e-450f-a63c-94cc8193eb41",
   "status": "accepted"
 }
 ```
 
+---
+
 ### 2. Endpoint Polling Hasil (`GET /result?id=<task_id>`)
 
-Anda wajb melakukan **polling request** ke endpoint ini tiap (minimal) 1 detik menggunakan `task_id` dari pembuatan task di atas sampai `status` bernilai `success` atau `error`.
+Anda wajib melakukan **polling request** ke endpoint ini tiap (minimal) 1 detik menggunakan `task_id` dari pembuatan task di atas sampai `status` bernilai `success` atau `error`.
 
-**Contoh Response Sukses dari Turnstile:**
+**Contoh Request Polling (cURL):**
+```bash
+curl -X GET "http://127.0.0.1:8001/result?id=8a31e3d4-b41e-450f-a63c-94cc8193eb41"
+```
+
+**Contoh Response Sukses dari Turnstile / reCAPTCHA v3:**
 ```json
 {
   "status": "success",
@@ -133,7 +170,7 @@ Anda wajb melakukan **polling request** ke endpoint ini tiap (minimal) 1 detik m
 }
 ```
 
-**Contoh Response Sukses dari cf_clearance/AWS WAF:**
+**Contoh Response Sukses dari cf_clearance / AWS WAF:**
 ```json
 {
   "status": "success",
@@ -153,19 +190,9 @@ Anda wajb melakukan **polling request** ke endpoint ini tiap (minimal) 1 detik m
 
 ---
 
-## ❗ Troubleshooting
-
-| Masalah | Solusi |
-|---|---|
-| `Version information not found at /root/.cache/camoufox/version.json` | Script sudah di-update untuk mencegah ini. Jika masih terjadi, jalankan manual `python3 -m camoufox fetch`. |
-| Berulang menginstall `playwright install-deps` | Pastikan Anda memiliki hak *sudo/root* jika package diinstall via sistem, dan jalankan perintah install pip menggunakan Virtual Environment (`venv`), lalu install manual via `python3 -m playwright install-deps` |
-| `Pool halaman berisi 0 / task tak selesai` | RAM penuh. Kurangi jumlah `thread` dan pastikan RAM longgar minimal ±300 MB per-thread. |
-
----
-
 ## 📄 Lisensi
 MIT License — Lihat [LICENSE](LICENSE).
 
 <div align="center">
-<b>⚡ Performa Tinggi &nbsp;|&nbsp; 🚀 Multi Solver &nbsp;|&nbsp; 🛡️ Camoufox Powered</b>
+<b>⚡ Performa Tinggi &nbsp;|&nbsp; 🚀 Multi Solver</b>
 </div>
