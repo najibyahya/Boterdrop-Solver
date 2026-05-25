@@ -69,6 +69,8 @@ class ClearanceAPIServer:
         self.app.get("/clearance")(self.process_clearance)
         self.app.get("/result")(self.get_result)
         self.app.get("/aws-token")(self.process_aws_token)
+        self.app.get("/recaptchaV3")(self.process_recaptcha)
+        self.app.post("/recaptchaV3")(self.process_recaptcha_post)
 
     # ──────────────────────────────────────────────
     #  PROXY
@@ -153,19 +155,45 @@ class ClearanceAPIServer:
                 await self.page_pool.put((page, context))
 
     async def _cleanup_results(self):
-        """Bersihkan semua hasil (success & error) yang sudah lebih dari 10 menit dan belum diambil."""
+        """Bersihkan hasil (success/error) yang sudah > 10 menit belum diambil.
+        Task yang masih berstatus 'process' TIDAK dihapus — cukup ditandai timeout
+        jika sudah melewati 300 detik, agar client tetap mendapat respons yang benar.
+        """
         while True:
             await asyncio.sleep(300)  # Cek setiap 5 menit
             now = time.time()
-            expired = [
-                tid for tid, res in list(self.results.items())
-                if isinstance(res, dict)
-                and now - res.get("start_time", now) > 300  # Hapus jika > 5 menit
-            ]
-            if expired:
-                for tid in expired:
-                    self.results.pop(tid, None)
-                logger.info(f"[Cleanup] Menghapus {len(expired)} hasil kedaluwarsa dari memori")
+            to_delete = []
+            to_timeout = []
+            for tid, res in list(self.results.items()):
+                if not isinstance(res, dict):
+                    continue
+                age = now - res.get("start_time", now)
+                status = res.get("status", "")
+                if status == "process":
+                    # Jika task sudah terlalu lama dalam status process, tandai error
+                    # agar client tidak menunggu selamanya — tapi JANGAN hapus dulu
+                    if age > 300:
+                        to_timeout.append(tid)
+                else:
+                    # Hapus hasil success/error yang sudah > 10 menit belum diambil
+                    if age > 600:
+                        to_delete.append(tid)
+            for tid in to_timeout:
+                if self.results.get(tid, {}).get("status") == "process":
+                    start_t = self.results[tid].get("start_time", now)
+                    self.results[tid] = {
+                        "status": "error",
+                        "elapsed_time": round(now - start_t, 3),
+                        "value": "timeout",
+                        "message": "Tugas timeout: tidak selesai dalam 300 detik",
+                        "start_time": start_t,
+                    }
+            if to_timeout:
+                logger.warning(f"[Cleanup] {len(to_timeout)} task ditandai timeout (process > 300s)")
+            for tid in to_delete:
+                self.results.pop(tid, None)
+            if to_delete:
+                logger.info(f"[Cleanup] Menghapus {len(to_delete)} hasil kedaluwarsa (> 10 menit) dari memori")
 
     async def _periodic_cleanup(self, interval_minutes: int = 10):
         """
@@ -233,7 +261,7 @@ class ClearanceAPIServer:
                 except Exception:
                     pass
 
-            # Fase 3.5: Buang page mati yang masuk pool selama proses close
+            # Fase 3.5: Buang dan TUTUP page mati yang masuk pool selama proses close
             # (dari worker yang selesai SEBELUM self.contexts dikosongkan di atas)
             stale = []
             try:
@@ -242,7 +270,12 @@ class ClearanceAPIServer:
             except asyncio.QueueEmpty:
                 pass
             if stale:
-                logger.info(f"[Cleanup] Membuang {len(stale)} stale page dari pool")
+                logger.info(f"[Cleanup] Menutup {len(stale)} stale page dari pool")
+                for stale_page, _ in stale:
+                    try:
+                        await stale_page.close()
+                    except Exception:
+                        pass
 
             # Fase 4: Recreate semua context dan page baru
             try:
@@ -707,6 +740,137 @@ class ClearanceAPIServer:
 
 
     # ──────────────────────────────────────────────
+    #  RECAPTCHA V3 SOLVER
+    # ──────────────────────────────────────────────
+
+    async def _solve_recaptcha(self, task_id: str, url: str, sitekey: str, action: str):
+        start_time = time.time()
+        browser = None
+        playwright = None
+        try:
+            from playwright.async_api import async_playwright
+            playwright = await async_playwright().start()
+            
+            # Setup proxy jika proxy_support aktif
+            proxy_args = None
+            if self.proxy_support and self.proxies:
+                proxy_str = self._next_proxy()
+                if proxy_str:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(proxy_str)
+                    if parsed.scheme and parsed.hostname:
+                        server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+                        if parsed.username and parsed.password:
+                            proxy_args = {"server": server, "username": parsed.username, "password": parsed.password}
+                        else:
+                            proxy_args = {"server": server}
+
+            logger.info(f"[reCAPTCHA] Menyiapkan browser Chromium — {task_id}")
+            browser = await playwright.chromium.launch(
+                headless=self.headless,
+                args=self.browser_args + ["--disable-gpu", "--disable-dev-shm-usage"]
+            )
+            
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+                proxy=proxy_args
+            )
+            page = await context.new_page()
+
+            # Intersepsi request (blokir gambar, media, font)
+            async def block_resources(route):
+                req_type = route.request.resource_type
+                if req_type in ["image", "media", "font"]:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+
+            await page.route("**/*", block_resources)
+
+            logger.info(f"[reCAPTCHA] Membuka URL: {url} — {task_id}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            logger.info(f"[reCAPTCHA] Memeriksa keberadaan script reCAPTCHA di halaman — {task_id}")
+            
+            has_recaptcha = False
+            try:
+                await page.wait_for_function("""() => {
+                    return typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function';
+                }""", timeout=15000)
+                has_recaptcha = True
+            except Exception:
+                pass
+
+            if not has_recaptcha:
+                logger.info(f"[reCAPTCHA] Script tidak terdeteksi, menyuntikkan script api.js secara manual — {task_id}")
+                inject_js = """(key) => {
+                    return new Promise((res, rej) => {
+                        const s = document.createElement('script');
+                        s.src = 'https://www.google.com/recaptcha/api.js?render=' + key;
+                        s.onload = () => {
+                            const i = setInterval(() => {
+                                if (typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') {
+                                    clearInterval(i);
+                                    res(true);
+                                }
+                            }, 100);
+                            setTimeout(() => { clearInterval(i); rej(new Error("Timeout menyuntikkan script Google reCAPTCHA")); }, 10000);
+                        };
+                        s.onerror = () => rej(new Error("Gagal memuat script Google reCAPTCHA"));
+                        document.head.appendChild(s);
+                    });
+                }"""
+                await page.evaluate(inject_js, sitekey)
+                logger.info(f"[reCAPTCHA] Script berhasil disuntikkan secara manual — {task_id}")
+            else:
+                logger.info(f"[reCAPTCHA] Script sudah terdeteksi di halaman — {task_id}")
+
+            logger.info(f"[reCAPTCHA] Mengeksekusi grecaptcha.execute (Action: '{action}') — {task_id}")
+            solve_js = """([key, act]) => {
+                return new Promise((res, rej) => {
+                    grecaptcha.ready(() => {
+                        grecaptcha.execute(key, { action: act })
+                            .then(res)
+                            .catch(err => rej(new Error(err.message || "Gagal mendapatkan token")));
+                    });
+                });
+            }"""
+            token = await page.evaluate(solve_js, [sitekey, action])
+
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": token}
+            logger.success(f"[reCAPTCHA] Sukses memecahkan — {task_id} ({elapsed}s)")
+
+        except Exception as e:
+            elapsed = round(time.time() - start_time, 3)
+            self.results[task_id] = {
+                "status": "error",
+                "elapsed_time": elapsed,
+                "value": "captcha_fail",
+                "message": f"Gagal menyelesaikan reCAPTCHA: {str(e)}"
+            }
+            logger.error(f"[reCAPTCHA] Exception — {task_id}: {e}")
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if playwright:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
+
+
+    # ──────────────────────────────────────────────
     #  ENDPOINTS
     # ──────────────────────────────────────────────
 
@@ -779,6 +943,28 @@ class ClearanceAPIServer:
             self.results.pop(task_id, None)
             return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
+    async def process_recaptcha(
+        self,
+        url: str = Query(..., description="URL target / Domain yang menggunakan reCAPTCHA v3"),
+        sitekey: str = Query(..., description="siteKey untuk Google reCAPTCHA v3"),
+        action: str = Query("submit", description="Action name untuk reCAPTCHA v3 (default: submit)")
+    ):
+        """
+        Endpoint untuk memecahkan Google reCAPTCHA v3.
+        Menerima parameter url, sitekey, dan action (opsional).
+        """
+        if not url or not sitekey:
+            raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' dan 'sitekey' wajib diisi"})
+
+        task_id = str(uuid.uuid4())
+        self.results[task_id] = {"status": "process", "message": "solving recaptcha v3", "start_time": time.time()}
+        try:
+            asyncio.create_task(self._solve_recaptcha(task_id, url, sitekey, action))
+            return JSONResponse(content={"task_id": task_id, "status": "accepted"}, status_code=202)
+        except Exception as e:
+            self.results.pop(task_id, None)
+            return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
     async def get_result(self, task_id: str = Query(..., alias="id")):
         if not task_id:
             return JSONResponse(content={"status": "error", "message": "Parameter id wajib diisi"}, status_code=400)
@@ -828,19 +1014,15 @@ def _print_banner():
  |  _ \ / _ \| __/ _ \ '__/ _` | '__/ _ \| '_ \
  | |_) | (_) | ||  __/ | | (_| | | | (_) | |_) |
  |____/ \___/ \__\___|_|  \__,_|_|  \___/| .__/
-  ____        _                           |_|
+  ____        _                          |_|
  / ___|  ___ | |_   _____ _ __
  \___ \ / _ \| \ \ / / _ \ '__|
-  ___) | (_) | |\ V /  __/ |    v1.0.4
+  ___) | (_) | |\ V /  __/ |    v1.0.5
  |____/ \___/|_| \_/ \___|_|
 """
     print("\033[95m" + banner + "\033[0m")
-    print("  \033[90m github.com/najibyahya/Turnstile-Solver\033[0m")
+    print("  \033[90m github.com/najibyahya/Boterdrop-Solver\033[0m")
     print()
-
-
-
-
 
 # ──────────────────────────────────────────────
 #  AUTO INSTALL
@@ -1095,7 +1277,7 @@ if __name__ == "__main__":
     config = _check_port(config)
 
     print("═" * 52)
-    print("  🚀  Memulai Boterdrop Clearance Solver...")
+    print("  🚀  Memulai Boterdrop Solver...")
     print("═" * 52 + "\n")
 
     app = create_app(
