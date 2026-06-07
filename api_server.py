@@ -70,7 +70,7 @@ class ClearanceAPIServer:
         self.app.get("/result")(self.get_result)
         self.app.get("/aws-token")(self.process_aws_token)
         self.app.get("/recaptchaV3")(self.process_recaptcha)
-        self.app.post("/recaptchaV3")(self.process_recaptcha_post)
+        self.app.post("/recaptchaV3")(self.process_recaptcha)
 
     # ──────────────────────────────────────────────
     #  PROXY
